@@ -1,4 +1,4 @@
-"""Convert a Parquet file (or every Parquet file in a folder) to CSV.
+"""Convert a Parquet file (or every Parquet file in a folder) to CSV.-----
 
 Usage:
     python parquet_to_csv.py data.parquet
