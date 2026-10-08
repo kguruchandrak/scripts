@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Working and generated files of extraction_qc.py
+*.partial
+*_debug_report.txt
+[0-9a-f]*_verified.csv
+[0-9a-f]*_verified_trial.csv
+!tests/expected_verified.csv
+!tests/expected_verified_skip.csv
+
+# Data: never commit the inputs of a QC run
+*.parquet
+*_extracted.csv
