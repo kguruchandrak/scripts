@@ -9,27 +9,107 @@ It only verifies what was extracted. It does not check that nothing was missed, 
 
 ## Input files
 
-Put these three files in one folder. They share a hash prefix (`<md5>` below):
+A run checks every md5 it finds. The three files of an md5 are named after it (`<md5>` below) and can be laid out
+in two ways.
 
 | File | Content |
 |---|---|
-| `<md5>_extracted.csv` | One row per extracted value. Needs at least `SourceLine`, `RelevancyParquetLine`, `SourceElementPath`, `Value`. |
-| `<md5>_original.parquet` | The original rows. Each row holds one DynamoDB JSON document as text in one column. |
-| `<md5>_relevant.parquet` | The relevant rows only, in the same layout. |
+| extracted file | One row per extracted value. Needs at least `SourceLine`, `RelevancyParquetLine`, `SourceElementPath`, `Value`. |
+| original file | The original rows. Each row holds one DynamoDB JSON document as text in one column. |
+| relevant file | The relevant rows only, in the same layout. |
 
-The files are found **by name** in the folder. The `SourceFilePath` and `RelevancyFileLocation` columns are not
-used, so they may point at another machine. If the folder holds several `*_extracted.csv` files, each one is
-checked against its own two parquet files; a problem with one file is reported by name and the others are still
+**Folder layout.** Four folders under the folder you run from, every file named after its md5 with its extension:
+
+```
+extracted/<md5>.csv           the extracted file
+original/<md5>.parquet        the original file
+relevant/<md5>.parquet        the relevant file
+verified/<md5>_verified.csv   the result, written by the script (the folder is created if it is missing)
+```
+
+The script uses this layout whenever an `extracted/` folder exists. The md5s to check are the files in `extracted/`.
+Files whose name starts with `.` or `~$` (the lock file Excel leaves beside an open CSV), folders, and files with
+another extension are ignored. A file in `original/` or `relevant/` with no extracted file is not used. If an
+extracted file has no original or relevant file, that md5 is reported by name (`relevant/<md5>.parquet`) and the
+others are still checked. Flat files (below) beside the folders are ignored, and a note says so.
+
+Two md5s that differ only in letter case (`extracted/abc.csv` and `extracted/ABC.parquet`) are not checked: on
+Windows both would use the same `original/` and `relevant/` files and write the same `verified/..._verified.csv`,
+so one result would silently replace the other. Both are reported as failed, by name; rename or remove one. This
+applies on every system, so a folder that works here still works after it is copied to Windows.
+
+**The extracted file can be CSV or parquet.** The format is taken from the extension, `.csv` or `.parquet`, in any
+case. If `extracted/` holds both for one md5, the one modified last is used and the output says which; if their
+modification times are equal the script stops for that md5 and names both files, because it cannot tell which is
+right (a file copy resets the time). Remove one, or touch the one you want.
+
+**Flat layout.** When there is no `extracted/` folder, everything is in one folder, as before:
+`<md5>_extracted.csv`, `<md5>_original.parquet` and `<md5>_relevant.parquet`, and the results are written next to
+them. Only a CSV extracted file is read in this layout.
+
+In both layouts the files are found **by name**. The `SourceFilePath` and `RelevancyFileLocation` columns are not
+used, so they may point at another machine. A problem with one md5 is reported by name and the others are still
 checked.
 
-The extracted CSV can be UTF-8 (with or without a byte order mark) or Windows-1252, which is what Excel's
-"CSV (Comma delimited)" writes: the script reads the whole file once to find out, and says so when it is not
-UTF-8. Fields can be of any length. Blank lines are not rows: they are skipped and not counted in `--rows` /
-`--limit` numbers. A required column that appears twice in the header stops the run.
+The extracted CSV can be UTF-8 (with or without a byte order mark), Windows-1252, which is what Excel's
+"CSV (Comma delimited)" writes, or UTF-16 or UTF-32 with a byte order mark (Excel's "Unicode Text"): the script
+reads the whole file once to find out, and says so when it is not UTF-8. Fields can be of any length. Blank lines
+are not rows: they are skipped and not counted in `--rows` / `--limit` numbers. A required column that appears
+twice in the header stops the run.
+
+Two awkward files are handled rather than misread:
+
+- **UTF-8 with a few bad bytes.** A file that is UTF-8 apart from a stray byte (one Windows-1252 character pasted
+  into UTF-8 text, say) is read as UTF-8, not as Windows-1252, which would turn every accented character into two wrong
+  ones. The bad bytes become `U+FFFD` and the run says how many there are and where the first is; a value that
+  holds one shows as `Wrong`. A file with no valid multi-byte characters at all is still read as Windows-1252.
+- **UTF-16 without a byte order mark** is full of NUL bytes and would look like a header with no columns. The run
+  stops with a message that says so; save the file as UTF-8, or pass `--csv-encoding utf-16-le` (or `utf-16-be`).
+
+### An extracted parquet file
+
+An extracted parquet file holds the same columns as the CSV and is checked the same way. The rules:
+
+- It needs `SourceLine`, `RelevancyParquetLine`, `SourceElementPath` and `Value`, each exactly once; a missing or
+  duplicated one stops that md5, as for a CSV.
+- **`SourceElementPath` and `Value` must be text columns** (string, binary, or dictionary-encoded text). Any other
+  type, a double or an integer or a timestamp for example, stops that md5 before any row is checked, with a message
+  such as `extracted/abc123.parquet: column 'Value' has type double, not text`. A typed `Value` cannot be checked
+  strictly: turning a float or a date into text would hide exactly the formatting differences the check exists to
+  find. If your extraction really writes typed values, tell whoever maintains the script.
+- `SourceLine` and `RelevancyParquetLine` can be integers, whole floats such as `5.0`, or text.
+- Rows are numbered from 1 in file order, for `--limit` and `--rows` too. The file is read one row group at a time,
+  so memory stays flat however many rows it has.
+- Every other column is carried into the verified CSV as text:
+
+| Parquet cell | Written as |
+|---|---|
+| null | empty |
+| boolean | `true` or `false` |
+| integer | its digits |
+| floating point | its shortest exact form: `12345.5`, `5.0`, `1e+22`, `nan` |
+| decimal | plain digits: `1.50` |
+| date, time, timestamp | ISO-8601: `2024-01-25`, `10:30:15`, `2024-01-25T10:30:00`; a fraction of a second is written when there is one, in six digits (`10:30:15.250000`) or, when the value has nanoseconds, nine |
+| timestamp with a time zone | the UTC instant with `+00:00`, whatever the zone is called: `2024-01-25T10:30:00+00:00` |
+| duration | `1:05:00`, `2 days, 0:00:01.500000`, a leading `-` when negative |
+| binary | UTF-8 text, or hexadecimal when it is not valid UTF-8 |
+| list, struct | compact JSON, the same rules inside: `[1,2]`, `{"a":1}` |
+| map | a JSON object with the keys as text: `{"k":1,"j":2}`; a map that repeats a key, which an object cannot hold, is a list of `[key, value]` pairs |
+| text | unchanged |
+
+Dates, times, timestamps and durations are converted from the numbers stored in the file, so they need nothing
+beyond `pyarrow`: Arrow's own conversion would need `pandas` for nanoseconds and the `tzdata` package (on Windows)
+for a time zone. A time zone is not applied: the file stores the instant in UTC, and that is what is written. If a
+column still cannot be converted, that md5 stops and the message names the column and its type.
+
+The verified result is always a CSV, written as UTF-8 with a byte order mark so that Excel shows every character.
+The same rows supplied as an extracted CSV or as an extracted parquet (all text) give identical verified rows.
+`--csv-encoding`, long-field handling and blank-line skipping are CSV-only and do not apply to parquet.
 
 ## Run
 
-Run it from the folder that holds the files (or give `--folder`):
+Run it from the folder that holds the files (the one that contains `extracted/`, or the flat files), or give
+`--folder`:
 
 ```
 python extraction_qc.py
@@ -39,27 +119,65 @@ It needs `pyarrow` (`pip install pyarrow`) and Python 3.8 or newer.
 
 | Switch | Effect |
 |---|---|
-| `--folder PATH` | Folder holding the input files (default: the current folder). |
+| `--folder PATH` | The folder that holds the layout: the four folders, or the flat files (default: the current folder). |
 | `--skip-original-on-relevant-failure` | Do not check the original file for rows that already failed the relevant file. They get `Skipped`. |
 | `--check-same-document` | Also require each relevant document to be contained in the original document at `SourceLine`, see below. |
 | `--limit N` | Check only the first N data rows of the extracted CSV (a trial run, see below). |
 | `--rows 17,203` | Check only these 1-based data rows of the extracted CSV (a trial run). |
 | `--original-column NAME`, `--relevant-column NAME` | Name the column that holds the JSON text, when automatic detection cannot decide. The column must be text (string or binary, dictionary-encoded is fine). |
-| `--csv-encoding NAME` | Text encoding of the extracted CSV, when the automatic choice (UTF-8, else Windows-1252) is wrong. |
+| `--csv-encoding NAME` | Text encoding of an extracted CSV, when the automatic choice (UTF-8, else Windows-1252) is wrong. Ignored for a parquet extracted file. |
 | `--temp-dir FOLDER` | Where the working files of a run go (default: the system temporary folder). |
-| `--fail-on-wrong` | Exit with code 3 when every file was checked but some rows are `Wrong`. |
+| `--fail-on-wrong` | Exit with code 3 when every file was checked or skipped but some rows are `Wrong`. A skipped md5 counts: its verified file is read for its `Wrong` rows (see "Re-running"). |
+| `--force` | Check every md5 even when its verified file is up to date (see "Re-running"). |
 | `--debug`, `--show-values` | Diagnostic report, see the debug section below. |
 
 The extracted CSV is never modified. Progress goes to stderr and the summary to stdout. Characters that the
 console cannot show are printed as `\u` escapes instead of stopping the run.
 
-**Exit code.** 0: every file was checked, whatever the verdicts. 1: at least one file could not be checked (the
-message names it). 3: everything was checked but some rows are `Wrong`, only with `--fail-on-wrong`. 2: a
-command-line mistake.
+**Exit code.** 0: every file was checked or skipped as already verified, whatever the verdicts.
+1: at least one file could not be checked (the message names it).
+3: everything was checked or skipped but some rows are `Wrong`, only with `--fail-on-wrong`.
+2: a command-line mistake.
 
 **Working files.** Each run writes one small result file per parquet file to the temporary folder and removes them
 at the end: about 12 bytes per correct row and a few hundred per wrong row, per file. Four million wrong rows is
 roughly a gigabyte, so use `--temp-dir` if the system drive is short of space.
+
+## Re-running: finished md5s are skipped
+
+In the folder layout a run does not repeat work that is already done. An md5 is **skipped** when
+`verified/<md5>_verified.csv` exists and is **newer** than the extracted, original and relevant files it would use
+and than `extraction_qc.py` itself. Each skipped md5 is listed, nothing of it is opened, and the last line of the
+run says how many md5s were checked, skipped and failed:
+
+```
+extracted/abc123.csv: skipped, verified/abc123_verified.csv is newer than its inputs and this script; --force rechecks it
+
+total: 0 checked, 1 skipped, 0 failed
+```
+
+- If any of the three inputs was replaced after the verified file was written, the md5 is checked again by itself.
+- A verified file with exactly the same time as an input is not trusted: a file system with coarse timestamps can
+  give a stale result and a changed input the same second, so equal times are checked again.
+- If `extraction_qc.py` was changed after the verified file was written, the md5 is checked again too: the old result
+  may come from different code. Copying a new version of the script to the machine therefore rechecks everything
+  once. Copying it with its old modification time does not; use `--force` then.
+- A trial run (`--limit`, `--rows`) is never skipped, because it writes its own file. A `.partial` file left by an
+  interrupted run is not a result, so that md5 is checked again.
+- A skipped md5 does not make the run fail. With `--fail-on-wrong` it still counts: the verified file is read for
+  its `Wrong` rows, so a gate that failed on the first run also fails on a re-run that skips. The skip line then
+  says how many (`... is newer than its inputs and this script (4,337 row(s) Wrong); --force rechecks it`), and a
+  verified file that cannot be read as a result is checked again instead. Reading it is much faster than the
+  check (8 seconds for a 745 MB file of four million rows on the test machine) but not free.
+- The flat layout always rechecks.
+
+**Use `--force` after changing switches.** The skip rule only looks at file times, not at the switches behind the
+existing result. If you earlier ran without `--check-same-document` and now want it, or you want a `--debug` report
+for an md5 that is already verified, nothing happens until you add `--force`, which rechecks every md5 and replaces
+its result.
+
+The times can mislead if files are copied: copying an input gives it a new time, which only causes a recheck, but a
+verified file copied in from elsewhere with a newer time would be skipped. Use `--force` then.
 
 ## Output
 
@@ -83,11 +201,13 @@ At the end the run prints how many rows were checked, the `Correct` / `Wrong` / 
 overall, and how many rows there are per reason code.
 
 **Trial runs.** With `--limit` or `--rows` the rows go to `<md5>_verified_trial.csv`, never to
-`<md5>_verified.csv`, so a quick look at 2,000 rows cannot overwrite the result of a full run.
+`<md5>_verified.csv`, and a `--debug` report goes to `<md5>_debug_report_trial.txt`, never to
+`<md5>_debug_report.txt`, so a quick look at 2,000 rows cannot overwrite the result or the report of a full run.
+In the folder layout these files, like the `.partial` file, are in `verified/` too.
 
 **A locked output.** If `<md5>_verified.csv` is open in Excel the run stops before checking anything and says so.
-If it becomes locked during the run, the finished results are kept in `<md5>_verified.csv.partial` and the message
-names it: close the other program and rename the file.
+If it becomes locked during the run, the finished results are kept in `<md5>_verified.csv.partial` (next to it, in
+`verified/`) and the message names it: close the other program and rename the file.
 
 ## Reason codes
 
@@ -147,8 +267,10 @@ The verified CSV is written as usual (and is identical to a run without `--debug
 
 - A **paste block** is printed at the end of the run: at most 50 lines of at most 120 characters, so it can be
   copied out of a restricted machine as a small amount of text. It never contains a real value.
-- A fuller report is written to `<md5>_debug_report.txt` in the same folder: every path shape, up to 10 failure
-  traces per reason code (at most 50 per file), the full skeleton.
+- A fuller report is written to `<md5>_debug_report.txt` (in `verified/` in the folder layout, next to the inputs
+  in the flat layout; `<md5>_debug_report_trial.txt` for a `--limit` or `--rows` run): every path shape,
+  up to 10 failure traces per reason code (at most 50 per file), the full skeleton. The report file names the md5
+  and the extracted file; the paste block never does (see below).
 
 **Masking.** Wherever sample text is needed it is shown as a shape: uppercase letters become `A`, other letters
 `a`, digits `9`, everything else is kept. `2024-01-25` shows as `9999-99-99`, `alice` as `aaaaa`, `True` as `Aaaa`.
@@ -169,7 +291,7 @@ Sections of the paste block, and what to look for:
 
 | Section | What it shows | What to look for |
 |---|---|---|
-| `-- input` | pyarrow version, rows, row groups and the JSON column of each parquet file; CSV row count and whether its rows are in ascending `SourceLine` / `RelevancyParquetLine` order; correct counts per file | The wrong JSON column; a CSV that is not in line order (the run is then slower). |
+| `-- input` | pyarrow version; the layout (`folder` or `flat`) and the extracted file's format, with its name written as `extracted/<md5>.csv` (the md5 itself is left out of the block); rows, row groups and the JSON column of each parquet file; the extracted file's row count (and row groups, if it is parquet) and whether its rows are in ascending `SourceLine` / `RelevancyParquetLine` order; correct counts per file | The wrong layout or the wrong format of extracted file (the run's own messages say which of two files was picked); the wrong JSON column; an extracted file that is not in line order (the run is then slower). |
 | `-- json skeleton` | The structure of the first 200 documents of each file: `Item.attribute:type`, with the DynamoDB type tags. Nested maps with more than 20 keys show as `{*}`; the item's own attribute names are always listed | Whether the two files have the same structure; paths that cannot exist. |
 | `-- path shapes` | `SourceElementPath` with array indexes replaced by `[*]`, worst 8 first: rows, rows correct in each file, and the most common reason where some fail | A shape that is correct in the relevant file but never in the original (`orig=0 [orig PATH_NOT_FOUND]`): the array indexes or the path differ between the two files. |
 | `-- reasons` | Rows per reason code for each file | Which kind of failure dominates. |
@@ -206,3 +328,19 @@ Peak memory is the same at both sizes. The random-order run produced identical v
 unsorted CSV at 1,000,000 rows was not measured and would be much slower than that, since the extra passes grow
 with both the file size and the number of chunks. Your machine and files will differ, so treat these as orders of
 magnitude: repeated runs differ by about 10%.
+
+The same generated data in the folder layout, with the extracted rows supplied as CSV and as parquet (all-text
+columns, row groups of 100,000 rows):
+
+| Original rows | Extracted file | Extracted size | Wall time | Peak memory |
+|---|---|---|---|---|
+| 100,000 | CSV, 400,000 rows | 72 MB | 27 s | 183 MB |
+| 100,000 | parquet, 400,000 rows | 2.6 MB | 27 s | 248 MB |
+| 1,000,000 | CSV, 4,000,000 rows | 728 MB | 4.5 min | 180 MB |
+| 1,000,000 | parquet, 4,000,000 rows | 28 MB | 3.8 min | 285 MB |
+| either, run a second time | skipped | | 0.3 s | 50 MB |
+
+Both formats gave identical verdict counts and identical verified files (apart from the byte order mark that only
+the parquet run writes). The parquet run uses more memory because it reads one row group (100,000 rows here) at
+a time. The figure stays flat as the file grows: 285 MB at 4,000,000 rows, against 248 MB at 400,000. Only row
+groups of 100,000 rows were measured; a file written with much larger row groups will need more memory per group.

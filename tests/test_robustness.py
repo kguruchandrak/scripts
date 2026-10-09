@@ -130,6 +130,103 @@ class EncodingTest(RobustnessCase):
             self.assertEqual(data.startswith(b"\xef\xbb\xbf"), bom, encoding)
             self.assertIn("café".encode("utf-8"), data)
 
+    def test_utf_16_and_utf_32_files_with_a_byte_order_mark_are_read(self):
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be", "utf-32"):
+            self.write(self.DOCS, [row(1, 1, "$.Item.name", "café"), row(1, 1, "$.Item.plain", "p")], encoding=encoding)
+            path = self.folder / "abc123_extracted.csv"
+            if encoding.endswith(("-le", "-be")):              # Python writes no mark for these: add it
+                mark = {"-le": b"\xff\xfe", "-be": b"\xfe\xff"}[encoding[-3:]]
+                path.write_bytes(mark + path.read_bytes())
+            code, out, err = self.run_main()
+            header, rows = self.verified()
+            col = {n: i for i, n in enumerate(header)}
+            self.assertEqual(code, 0, (encoding, err))
+            self.assertIn("is not UTF-8; it was read as utf-", err)
+            self.assertEqual(header[:len(fixtures.HEADER)], fixtures.HEADER, encoding)
+            self.assertEqual([r[col["OverallVerification"]] for r in rows], ["Correct", "Correct"], encoding)
+            self.assertEqual(rows[0][col["Value"]], "café")
+            self.assertTrue((self.folder / "abc123_verified.csv").read_bytes().startswith(b"\xef\xbb\xbf"))
+
+    def test_the_detection_names_utf_16_and_utf_32(self):
+        self.write(self.DOCS, [row(1, 1, "$.Item.name", "x")], encoding="utf-16")
+        self.assertEqual(qc.detect_csv_encoding(self.folder / "abc123_extracted.csv"), "utf-16")
+        self.write(self.DOCS, [row(1, 1, "$.Item.name", "x")], encoding="utf-32")
+        self.assertEqual(qc.detect_csv_encoding(self.folder / "abc123_extracted.csv"), "utf-32")
+
+    def test_utf_16_without_a_byte_order_mark_is_named_not_misread(self):
+        for text in ("x", "café"):                           # ASCII only decodes as UTF-8; the accent as Windows-1252
+            self.write(self.DOCS, [row(1, 1, "$.Item.name", text)], encoding="utf-16-le")
+            code, _, err = self.run_main()
+            self.assertEqual(code, 1, text)
+            self.assertIn("contains NUL bytes", err)
+            self.assertIn("which is how UTF-16 text looks without a byte order mark", err)
+            self.assertIn("--csv-encoding utf-16-le", err)
+            self.assertNotIn("missing required column", err)
+            self.assertFalse((self.folder / "abc123_verified.csv").exists())
+
+    def test_utf_16_without_a_byte_order_mark_runs_when_the_encoding_is_given(self):
+        self.write(self.DOCS, [row(1, 1, "$.Item.name", "café")], encoding="utf-16-le")
+        code, _, err = self.run_main("--csv-encoding", "utf-16-le")
+        self.assertEqual(code, 0, err)
+        header, rows = self.verified()
+        self.assertEqual(rows[0][header.index("OverallVerification")], "Correct")
+        self.assertEqual(rows[0][header.index("Value")], "café")
+
+    def stray_byte_file(self, rows=None):
+        """UTF-8 text in which one value holds a single Windows-1252 byte (0xE9)."""
+        self.write(self.DOCS, rows or [row(1, 1, "$.Item.name", "café"), row(1, 1, "$.Item.plain", "p@@"),
+                                       row(1, 1, "$.Item.name", "café")])
+        path = self.folder / "abc123_extracted.csv"
+        path.write_bytes(path.read_bytes().replace(b"@@", b"\xe9"))
+        return path
+
+    def test_utf_8_with_one_stray_byte_is_not_read_as_windows_1252(self):
+        self.stray_byte_file()
+        code, out, err = self.run_main()
+        header, rows = self.verified()
+        col = {n: i for i, n in enumerate(header)}
+        self.assertEqual(code, 0, err)
+        self.assertEqual([r[col["Value"]] for r in rows], ["café", "p\ufffd", "café"])    # no "cafÃ©"
+        self.assertEqual([r[col["OverallVerification"]] for r in rows], ["Correct", "Wrong", "Correct"])
+        self.assertIn("abc123_extracted.csv is UTF-8 apart from 1 byte(s) that are not valid UTF-8 (the first on line 3)",
+                      err)
+        self.assertIn("U+FFFD", err)
+        self.assertTrue((self.folder / "abc123_verified.csv").read_bytes().startswith(b"\xef\xbb\xbf"))
+
+    def test_the_detection_of_stray_bytes(self):
+        path = self.stray_byte_file()
+        self.assertEqual(qc.detect_csv_encoding(path), "cp1252")             # what the encoding alone says
+        self.assertEqual(qc.stray_utf8_bytes(path), (1, 3))
+        self.write(self.DOCS, [row(1, 1, "$.Item.name", "café")], encoding="cp1252")
+        self.assertIsNone(qc.stray_utf8_bytes(self.folder / "abc123_extracted.csv"))     # real Windows-1252
+        self.write(self.DOCS, [row(1, 1, "$.Item.plain", "p\x81")], encoding="latin-1")
+        self.assertIsNone(qc.stray_utf8_bytes(self.folder / "abc123_extracted.csv"))
+        self.write(self.DOCS, [row(1, 1, "$.Item.plain", "p")], encoding="utf-8")
+        self.assertIsNone(qc.stray_utf8_bytes(self.folder / "abc123_extracted.csv"))     # nothing stray at all
+
+    def test_mostly_windows_1252_with_an_accidental_utf_8_pair_stays_windows_1252(self):
+        rows = [row(1, 1, "$.Item.name", "café")] * 5 + [row(1, 1, "$.Item.plain", "\xc3\xa9")]
+        self.write(self.DOCS, rows, encoding="latin-1")
+        triple = qc.find_triples(self.folder)[0]
+        qc.prepare_triple(triple)
+        self.assertEqual((triple.encoding, triple.encoding_errors), ("cp1252", "strict"))
+
+    def test_a_stray_byte_far_into_a_large_file_is_found(self):
+        rows = ([row(1, 1, "$.Item.plain", "p")] * 20000 + [row(1, 1, "$.Item.name", "café")] * 3
+                + [row(1, 1, "$.Item.plain", "p@@")])
+        path = self.stray_byte_file(rows)
+        self.assertEqual(qc.stray_utf8_bytes(path), (1, 20005))        # header, 20,000 + 3 rows, then the stray one
+
+    def test_as_many_stray_bytes_as_valid_characters_is_not_taken_for_utf_8(self):
+        path = self.stray_byte_file([row(1, 1, "$.Item.name", "café"), row(1, 1, "$.Item.plain", "p@@")])
+        self.assertIsNone(qc.stray_utf8_bytes(path))
+
+    def test_a_given_encoding_is_never_second_guessed(self):
+        self.stray_byte_file()
+        code, _, err = self.run_main("--csv-encoding", "utf-8")
+        self.assertEqual(code, 1)
+        self.assertIn("cannot be decoded as utf-8", err)
+
     def test_text_the_input_encoding_could_not_hold_is_still_written(self):
         # the reason quotes the document's value, which a Windows-1252 file could not store
         self.write([doc(name=S("中文"))], [row(1, 1, "$.Item.name", "café")], encoding="cp1252")

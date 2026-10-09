@@ -1,21 +1,28 @@
 """QC check for the parquet extraction process.
 
-Verifies that every row of an extracted-values CSV is true: that the row at
-RelevancyParquetLine of the relevant parquet file, and the row at SourceLine of
+Verifies that every row of an extracted-values file (CSV or parquet) is true: that the
+row at RelevancyParquetLine of the relevant parquet file, and the row at SourceLine of
 the original parquet file, really contain SourceElementPath with Value.
 
-Inputs, all in the working folder and sharing one hash prefix:
-    <md5>_extracted.csv     one row per extracted value
-    <md5>_original.parquet  original DynamoDB documents, one JSON text per row
-    <md5>_relevant.parquet  relevant rows only, same layout
+Every md5 has three input files, laid out in one of two ways.  The folder layout is used
+when an extracted/ folder exists in the working folder, the flat layout otherwise:
 
-Output: <md5>_verified.csv = every column of the extracted CSV plus
+    Folder layout                           Flat layout (everything in one folder)
+    extracted/<md5>.csv or .parquet         <md5>_extracted.csv
+    original/<md5>.parquet                  <md5>_original.parquet
+    relevant/<md5>.parquet                  <md5>_relevant.parquet
+    verified/<md5>_verified.csv   (result)  <md5>_verified.csv   (result, next to the inputs)
+
+Output: the verified CSV = every column of the extracted file plus
     RelevantFileVerification, RelevantFileReason,
     OriginalFileVerification, OriginalFileReason, OverallVerification
 
 Usage:
-    python extraction_qc.py
-    python extraction_qc.py --debug --limit 2000
+    python extraction_qc.py                          check every md5; in the folder layout an md5 whose
+                                                     verified file is up to date is skipped
+    python extraction_qc.py --force                  check every md5 again
+    python extraction_qc.py --debug --limit 2000     a trial run with a short diagnostic block
+    python extraction_qc.py --folder D               the layout is under D
     python extraction_qc.py --skip-original-on-relevant-failure
 
 See EXTRACTION_QC.md for the rules and the reason codes.
@@ -33,7 +40,8 @@ import tempfile
 import traceback
 from bisect import bisect_right
 from collections import Counter, OrderedDict, defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from datetime import time as dtime
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
@@ -69,36 +77,147 @@ raise_csv_field_limit()
 # --------------------------------------------------------------------------- #
 # Input discovery
 # --------------------------------------------------------------------------- #
-class Triple:
-    """The three input files that share one hash prefix, and the output they produce."""
+FLAT, FOLDER = "flat", "folder"
+EXTRACTED_FORMATS = {".csv": "csv", ".parquet": "parquet"}   # by extension, compared in lower case
 
-    def __init__(self, folder: Path, prefix: str):
+
+class Triple:
+    """The files of one md5 and the outputs it produces, wherever the layout puts them.
+
+    Flat layout:   <md5>_extracted.csv, <md5>_original.parquet, <md5>_relevant.parquet in one folder,
+                   outputs next to them.
+    Folder layout: extracted/<md5>.csv or .parquet, original/<md5>.parquet, relevant/<md5>.parquet,
+                   outputs in verified/.
+    """
+
+    def __init__(self, folder: Path, prefix: str, layout: str = FLAT, extracted: Path = None):
+        self.folder = Path(folder)
         self.prefix = prefix
-        self.extracted = folder / (prefix + EXTRACTED_SUFFIX)
-        self.original = folder / (prefix + "_original.parquet")
-        self.relevant = folder / (prefix + "_relevant.parquet")
-        self.verified = folder / (prefix + "_verified.csv")
-        self.trial = folder / (prefix + "_verified_trial.csv")
-        self.debug_report = folder / (prefix + "_debug_report.txt")
-        self.encoding = "utf-8-sig"   # of the extracted CSV; set by prepare_triple
+        self.layout = layout
+        if layout == FOLDER:
+            self.extracted = extracted if extracted is not None else self.folder / "extracted" / (prefix + ".csv")
+            self.original = self.folder / "original" / (prefix + ".parquet")
+            self.relevant = self.folder / "relevant" / (prefix + ".parquet")
+            out_dir = self.folder / "verified"
+        else:
+            self.extracted = extracted if extracted is not None else self.folder / (prefix + EXTRACTED_SUFFIX)
+            self.original = self.folder / (prefix + "_original.parquet")
+            self.relevant = self.folder / (prefix + "_relevant.parquet")
+            out_dir = self.folder
+        self.output_dir = out_dir
+        names = (prefix + "_verified.csv", prefix + "_verified_trial.csv", prefix + "_debug_report.txt",
+                 prefix + "_debug_report_trial.txt")
+        self.verified, self.trial, self.debug_report, self.trial_debug_report = (out_dir / name for name in names)
+        self.extracted_format = EXTRACTED_FORMATS.get(self.extracted.suffix.lower(), "csv")
+        self.error = None            # a problem found while discovering this md5 (two ambiguous extracted files)
+        self.notes = []              # progress lines, e.g. which of two extracted files was used
+        self.encoding = "utf-8-sig"  # of the extracted CSV; set by prepare_triple
+        self.encoding_errors = "strict"   # "replace" for UTF-8 text with a few bytes that are not UTF-8
         self.encoding_note = ""
 
+    def show(self, path) -> str:
+        """A path as shown in messages: relative to the working folder, with forward slashes."""
+        try:
+            return Path(path).relative_to(self.folder).as_posix()
+        except ValueError:
+            return Path(path).name
+
+    @property
+    def label(self) -> str:
+        return self.show(self.extracted)
+
+    @property
+    def pattern(self) -> str:
+        """The extracted file's name with the md5 left out, for the debug block that is pasted elsewhere."""
+        if self.layout == FOLDER:
+            return "extracted/<md5>" + self.extracted.suffix
+        return "<md5>" + EXTRACTED_SUFFIX
+
     def check_files(self) -> None:
-        missing = [p.name for p in (self.original, self.relevant) if not p.is_file()]
+        if self.error:
+            raise InputError(self.error)
+        missing = [self.show(p) for p in (self.original, self.relevant) if not p.is_file()]
         if missing:
-            raise InputError(
-                "%s: missing input file(s) in %s: %s"
-                % (self.extracted.name, self.extracted.parent, ", ".join(missing))
-            )
+            raise InputError("%s: missing input file(s): %s" % (self.label, ", ".join(missing)))
 
 
-def find_triples(folder: Path) -> list:
-    """One Triple per <prefix>_extracted.csv in the folder (files are located by name only)."""
+class Discovery:
+    """What was found in the working folder: the layout, one Triple per md5, and notes to print."""
+
+    def __init__(self, layout: str, triples: list, notes: list):
+        self.layout = layout
+        self.triples = triples
+        self.notes = notes
+
+
+def _flat_triples(folder: Path) -> list:
     return [
         Triple(folder, path.name[: -len(EXTRACTED_SUFFIX)])
         for path in sorted(folder.glob("*" + EXTRACTED_SUFFIX))
         if path.is_file()
     ]
+
+
+def _is_md5_file(path: Path) -> bool:
+    """A regular file with a .csv or .parquet extension that is not hidden and not an Excel lock file."""
+    return (path.is_file() and path.suffix.lower() in EXTRACTED_FORMATS
+            and not path.name.startswith((".", "~$")))
+
+
+def _folder_triples(folder: Path, notes: list) -> list:
+    by_md5 = {}
+    for path in sorted((folder / "extracted").iterdir()):
+        if _is_md5_file(path):
+            by_md5.setdefault(path.stem, []).append(path)
+    spellings = {}      # the md5 in lower case -> every way it is spelled in extracted/
+    for md5 in by_md5:
+        spellings.setdefault(md5.casefold(), []).append(md5)
+    triples = []
+    for md5 in sorted(by_md5):
+        triple = Triple(folder, md5, FOLDER, extracted=by_md5[md5][0])
+        others = [by_md5[other][0] for other in sorted(spellings[md5.casefold()]) if other != md5]
+        if others:   # on Windows both would read the same input files and write the same verified file
+            triple.error = ("%s: the md5 differs only in letter case from that of %s; on a case-insensitive file "
+                            "system such as Windows both would use the same files and write the same verified "
+                            "file, so neither is checked. Rename or remove one of them"
+                            % (triple.label, ", ".join(triple.show(p) for p in others)))
+        elif len(by_md5[md5]) > 1:
+            _choose_extracted(triple, by_md5[md5])
+        triples.append(triple)
+    return triples
+
+
+def _choose_extracted(triple: Triple, paths: list) -> None:
+    """Several extracted files for one md5: the newer one wins, equal times are ambiguous."""
+    by_time = sorted(paths, key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    newest, runner_up = by_time[0], by_time[1]
+    if newest.stat().st_mtime_ns == runner_up.stat().st_mtime_ns:
+        triple.error = ("%s: %s and %s have the same modification time, so it is ambiguous which extracted file "
+                        "to use; remove one of them" % (triple.show(newest), triple.show(newest), triple.show(runner_up)))
+        return
+    triple.extracted = newest
+    triple.extracted_format = EXTRACTED_FORMATS[newest.suffix.lower()]
+    triple.notes.append("note: %s: using %s (newer than %s)"
+                        % (triple.prefix, triple.show(newest), ", ".join(triple.show(p) for p in by_time[1:])))
+
+
+def discover(folder: Path) -> Discovery:
+    """Find the layout and the md5s to check.  The folder layout is used when an extracted/ folder exists
+    (flat files beside it are ignored, with a note); otherwise the flat layout."""
+    folder = Path(folder)
+    if not (folder / "extracted").is_dir():
+        return Discovery(FLAT, _flat_triples(folder), [])
+    notes = []
+    flat = [p.name for p in sorted(folder.glob("*" + EXTRACTED_SUFFIX)) if p.is_file()]
+    if flat:
+        notes.append("note: extracted/ exists, so the folder layout is used and %d flat file(s) are ignored: %s"
+                     % (len(flat), ", ".join(flat[:3]) + (", ..." if len(flat) > 3 else "")))
+    return Discovery(FOLDER, _folder_triples(folder, notes), notes)
+
+
+def find_triples(folder: Path) -> list:
+    """One Triple per md5 in the working folder (files are located by name only)."""
+    return discover(folder).triples
 
 
 def check_required_columns(header: list, csv_name: str) -> None:
@@ -125,18 +244,58 @@ def _decodes(path, encoding: str) -> bool:
                 return True
 
 
+_NOT_ASCII = re.compile("[^\x00-\x7f\ufffd]")
+_BYTE_ORDER_MARKS = ((codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),   # before UTF-16: FF FE 00 00
+                     (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"))
+
+
 def detect_csv_encoding(path) -> str:
-    """UTF-8 when the file is valid UTF-8, else Windows-1252 (what Excel's "CSV (Comma delimited)"
-    writes), else Latin-1, which can decode any bytes."""
+    """UTF-16 or UTF-32 when the file starts with their byte order mark (what Excel's "Unicode Text" and
+    Notepad's "Unicode" write), UTF-8 when the file is valid UTF-8, else Windows-1252 (what Excel's "CSV
+    (Comma delimited)" writes), else Latin-1, which can decode any bytes."""
     with open(str(path), "rb") as handle:
-        bom = handle.read(3) == b"\xef\xbb\xbf"
+        head = handle.read(4)
+    for mark, name in _BYTE_ORDER_MARKS:
+        if head.startswith(mark) and _decodes(path, name):
+            return name
     if _decodes(path, "utf-8"):
-        return "utf-8-sig" if bom else "utf-8"
+        return "utf-8-sig" if head.startswith(codecs.BOM_UTF8) else "utf-8"
     return "cp1252" if _decodes(path, "cp1252") else "latin-1"
 
 
-def read_header(csv_path: Path, encoding: str = "utf-8-sig") -> list:
-    with open(str(csv_path), newline="", encoding=encoding) as handle:
+def check_no_nul_bytes(path, label: str) -> None:
+    """UTF-16 text without a byte order mark is full of NUL bytes and would be read as garbled UTF-8 (the
+    header would then seem to lack every column); say so instead."""
+    with open(str(path), "rb") as handle:
+        if b"\x00" in handle.read(1 << 16):
+            raise InputError("%s: the file contains NUL bytes, which is how UTF-16 text looks without a byte order "
+                             "mark. Save it as UTF-8, or pass --csv-encoding utf-16-le (or utf-16-be)" % label)
+
+
+def stray_utf8_bytes(path):
+    """For a file that is not valid UTF-8: (how many bytes are not, line of the first) when the rest is UTF-8
+    text, meaning more multi-byte characters than stray bytes; None for a file that is Windows-1252 or other
+    single-byte text, which has hardly any valid multi-byte sequences."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    stray = valid = lines = 0
+    first = None
+    with open(str(path), "rb") as handle:
+        while True:
+            chunk = handle.read(1 << 20)
+            text = decoder.decode(chunk, final=not chunk)
+            bad = text.count("\ufffd")
+            if bad and first is None:
+                first = lines + text[: text.index("\ufffd")].count("\n") + 1
+            stray += bad
+            valid += len(_NOT_ASCII.findall(text))
+            lines += text.count("\n")
+            if not chunk:
+                break
+    return (stray, first) if stray and valid > stray else None
+
+
+def read_header(csv_path: Path, encoding: str = "utf-8-sig", errors: str = "strict") -> list:
+    with open(str(csv_path), newline="", encoding=encoding, errors=errors) as handle:
         header = next(csv.reader(handle), None)
     if not header:
         raise InputError("%s: the file is empty (no header row)" % csv_path.name)
@@ -149,21 +308,39 @@ def prepare_triple(triple: Triple, header_out: list = None, encoding: str = None
     Also settles the encoding of the extracted CSV (`encoding` forces it) into triple.encoding.
     """
     triple.check_files()
+    if triple.extracted_format == "parquet":  # no CSV encoding to find; the reader validates the columns
+        header = ParquetExtractedInput.open(triple.extracted, triple.label).header
+        triple.encoding, triple.encoding_note = "utf-8-sig", ""
+        if header_out is not None:
+            header_out[:] = header
+        return header
+    triple.encoding_errors = "strict"
+    stray = None
     if encoding:
         try:
             codecs.lookup(encoding)
         except LookupError:
             raise InputError("unknown CSV encoding %r" % encoding)
         if not _decodes(triple.extracted, encoding):
-            raise InputError("%s: the file cannot be decoded as %s" % (triple.extracted.name, encoding))
+            raise InputError("%s: the file cannot be decoded as %s" % (triple.label, encoding))
         triple.encoding = encoding
     else:
         triple.encoding = detect_csv_encoding(triple.extracted)
+        if not triple.encoding.startswith(("utf-16", "utf-32")):
+            check_no_nul_bytes(triple.extracted, triple.label)
+        if triple.encoding in ("cp1252", "latin-1"):
+            stray = stray_utf8_bytes(triple.extracted)
+            if stray:  # UTF-8 text with a few bad bytes: reading it all as Windows-1252 would garble every accent
+                triple.encoding, triple.encoding_errors = "utf-8", "replace"
     is_utf8 = codecs.lookup(triple.encoding).name in ("utf-8", "utf-8-sig")
     triple.encoding_note = "" if is_utf8 else "%s is not UTF-8; it was read as %s" % (
-        triple.extracted.name, triple.encoding)
-    header = read_header(triple.extracted, triple.encoding)
-    check_required_columns(header, triple.extracted.name)
+        triple.label, triple.encoding)
+    if stray:
+        triple.encoding_note = ("%s is UTF-8 apart from %s byte(s) that are not valid UTF-8 (the first on line %d); "
+                                "they were read as U+FFFD, so a value holding one will show as wrong"
+                                % (triple.label, format(stray[0], ","), stray[1]))
+    header = read_header(triple.extracted, triple.encoding, triple.encoding_errors)
+    check_required_columns(header, triple.label)
     if header_out is not None:
         header_out[:] = header
     return header
@@ -444,6 +621,15 @@ def mismatch_reason(expected, tag, value) -> str:
 # --------------------------------------------------------------------------- #
 # Parquet files
 # --------------------------------------------------------------------------- #
+def is_text_type(kind) -> bool:
+    """String or binary columns, including dictionary-encoded ones and the newer 'view' types."""
+    if pa.types.is_dictionary(kind):
+        kind = kind.value_type
+    checks = [pa.types.is_string, pa.types.is_large_string, pa.types.is_binary, pa.types.is_large_binary]
+    checks += [getattr(pa.types, name) for name in ("is_string_view", "is_binary_view") if hasattr(pa.types, name)]
+    return any(check(kind) for check in checks)
+
+
 class ParquetJson:
     """A parquet file whose rows each hold one JSON document as text in a single column."""
 
@@ -477,12 +663,7 @@ class ParquetJson:
 
     @staticmethod
     def _is_text_type(kind) -> bool:
-        """String or binary columns, including dictionary-encoded ones and the newer 'view' types."""
-        if pa.types.is_dictionary(kind):
-            kind = kind.value_type
-        checks = [pa.types.is_string, pa.types.is_large_string, pa.types.is_binary, pa.types.is_large_binary]
-        checks += [getattr(pa.types, name) for name in ("is_string_view", "is_binary_view") if hasattr(pa.types, name)]
-        return any(check(kind) for check in checks)
+        return is_text_type(kind)
 
     def _text_columns(self) -> list:
         return [field.name for field in self.pf.schema_arrow if self._is_text_type(field.type)]
@@ -605,31 +786,61 @@ class RowCursor:
 # --------------------------------------------------------------------------- #
 # The extracted CSV
 # --------------------------------------------------------------------------- #
-class CsvInput:
-    """The extracted CSV: its header and column positions, and the row filter for trial runs."""
+class ExtractedInput:
+    """The rows of an extracted file as text: header, column positions and the row filter for trial runs.
 
-    def __init__(self, path, header: list, limit: int = None, rows: set = None, encoding: str = "utf-8-sig"):
+    A subclass reads one format; the lanes, the merge pass and the debug collector only use `header`,
+    `index` (column name to position), `rows()` (yielding the 1-based row number and the cells as text)
+    and `output_encoding` (the encoding the verified CSV is written in).
+    """
+
+    output_encoding = "utf-8-sig"
+
+    def __init__(self, path, header: list, limit: int = None, rows: set = None):
         self.path = Path(path)
         self.header = header
         self.index = {name: i for i, name in enumerate(header)}
         self.limit = limit
         self.rows_filter = rows
         self.last_row = max(rows) if rows else None
+
+    def _wanted(self, number: int):
+        """True: take row number `number`; False: skip it; None: every wanted row has been passed, stop."""
+        if self.limit is not None and number > self.limit:
+            return None
+        if self.last_row is not None and number > self.last_row:
+            return None
+        if self.rows_filter is not None and number not in self.rows_filter:
+            return False
+        return True
+
+    def rows(self):
+        raise NotImplementedError
+
+
+class CsvInput(ExtractedInput):
+    """An extracted CSV file."""
+
+    def __init__(self, path, header: list, limit: int = None, rows: set = None, encoding: str = "utf-8-sig",
+                 errors: str = "strict"):
+        super().__init__(path, header, limit, rows)
         self.encoding = encoding
+        self.errors = errors
 
     @property
     def output_encoding(self) -> str:
         """The verified CSV is plain UTF-8 only when the input was; otherwise UTF-8 with a byte order mark
         (so Excel shows every character, including text from the parquet files that the input's own
         encoding may not be able to hold)."""
-        return "utf-8" if codecs.lookup(self.encoding).name == "utf-8" else "utf-8-sig"
+        plain = codecs.lookup(self.encoding).name == "utf-8" and self.errors == "strict"
+        return "utf-8" if plain else "utf-8-sig"
 
     def rows(self):
         """Yield (1-based data row number, fields) for the rows selected by --limit / --rows.
 
         Blank lines are not rows: they are skipped and not counted."""
         width = len(self.header)
-        with open(str(self.path), newline="", encoding=self.encoding) as handle:
+        with open(str(self.path), newline="", encoding=self.encoding, errors=self.errors) as handle:
             reader = csv.reader(handle)
             next(reader, None)  # header
             number = 0
@@ -637,15 +848,298 @@ class CsvInput:
                 if not fields:  # blank line
                     continue
                 number += 1
-                if self.limit is not None and number > self.limit:
+                wanted = self._wanted(number)
+                if wanted is None:
                     return
-                if self.last_row is not None and number > self.last_row:
-                    return
-                if self.rows_filter is not None and number not in self.rows_filter:
+                if not wanted:
                     continue
                 if len(fields) < width:
                     fields = fields + [""] * (width - len(fields))
                 yield number, fields
+
+
+def cell_text(value) -> str:
+    """A parquet cell (as a Python value) as the text it is written as in the verified CSV.
+
+    null -> empty; bool -> true/false; int -> digits; float -> its shortest exact form (repr); decimal ->
+    plain digits; date, time and timestamp -> ISO-8601; binary -> UTF-8 text, or hexadecimal when it is not
+    valid UTF-8; list, struct and map -> compact JSON (the same rules apply inside).  Temporal columns do not
+    arrive here as datetime objects: arrow_to_python writes them as text itself (see there).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, (datetime, date, dtime)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            return bytes(value).hex()
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=cell_text)
+    if isinstance(value, timedelta):
+        return str(value)
+    return str(value)
+
+
+# Dates, times, timestamps and durations are turned into text from their stored integers, not through
+# datetime objects: Arrow's own conversion needs pandas for nanoseconds and a time zone database (the
+# tzdata package, on Windows) for a time zone, and a machine with only pyarrow has neither.
+_TICKS_PER_SECOND = {"s": 1, "ms": 10 ** 3, "us": 10 ** 6, "ns": 10 ** 9}
+
+
+def _civil_date(days: int) -> str:
+    """The date `days` after 1970-01-01 (negative: before) as YYYY-MM-DD, for any year."""
+    era, doe = divmod(days + 719468, 146097)
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    month = mp + 3 if mp < 10 else mp - 9
+    year = yoe + era * 400 + (1 if month <= 2 else 0)
+    return "%s%04d-%02d-%02d" % ("-" if year < 0 else "", abs(year), month, doy - (153 * mp + 2) // 5 + 1)
+
+
+def _fraction(ticks: int, per_second: int) -> str:
+    """The fractional-second suffix: none for a whole second; six digits when the value is no finer than a
+    microsecond (what datetime.isoformat writes); nine when it has nanoseconds."""
+    if not ticks:
+        return ""
+    nanos = ticks * (10 ** 9 // per_second)
+    return ".%06d" % (nanos // 1000) if nanos % 1000 == 0 else ".%09d" % nanos
+
+
+def _clock(seconds: int, ticks: int, per_second: int) -> str:
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return "%02d:%02d:%02d%s" % (hours, minutes, secs, _fraction(ticks, per_second))
+
+
+def timestamp_text(count: int, unit: str, aware: bool) -> str:
+    """`count` units since 1970-01-01T00:00:00 as ISO-8601.  A timestamp with a time zone is stored as a
+    UTC instant, and is written as that instant with +00:00 whatever the zone is called."""
+    per_second = _TICKS_PER_SECOND[unit]
+    seconds, ticks = divmod(count, per_second)
+    days, in_day = divmod(seconds, 86400)
+    return "%sT%s%s" % (_civil_date(days), _clock(in_day, ticks, per_second), "+00:00" if aware else "")
+
+
+def duration_text(count: int, unit: str) -> str:
+    """A duration like Python writes a timedelta (1:05:00, 1 day, 0:00:01.500000); a negative one has a
+    leading minus sign (-0:00:01)."""
+    per_second = _TICKS_PER_SECOND[unit]
+    seconds, ticks = divmod(abs(count), per_second)
+    days, in_day = divmod(seconds, 86400)
+    hours, rest = divmod(in_day, 3600)
+    minutes, secs = divmod(rest, 60)
+    return "%s%s%d:%02d:%02d%s" % ("-" if count < 0 else "",
+                                   "%d day%s, " % (days, "" if days == 1 else "s") if days else "",
+                                   hours, minutes, secs, _fraction(ticks, per_second))
+
+
+def _temporal_texts(array) -> list:
+    """The text of every value of a date, time, timestamp or duration array (None for null)."""
+    kind, types = array.type, pa.types
+    integers = array.view(pa.int32() if kind.bit_width == 32 else pa.int64()).to_pylist()
+    if types.is_timestamp(kind):
+        aware = kind.tz is not None
+        convert = lambda n: timestamp_text(n, kind.unit, aware)
+    elif types.is_date32(kind):
+        convert = _civil_date
+    elif types.is_date64(kind):
+        convert = lambda n: _civil_date(n // 86400000)
+    elif types.is_time(kind):
+        per_second = _TICKS_PER_SECOND[kind.unit]
+        convert = lambda n: _clock(*divmod(n, per_second), per_second)
+    else:
+        convert = lambda n: duration_text(n, kind.unit)
+    return [None if n is None else convert(n) for n in integers]
+
+
+@lru_cache(maxsize=None)
+def _needs_arrow_conversion(kind) -> bool:
+    """True when values of this Arrow type cannot simply go through to_pylist(): temporal types (see above)
+    and maps (to_pylist gives a list of pairs), also when they sit inside a list or a struct."""
+    types = pa.types
+    if types.is_timestamp(kind) or types.is_date(kind) or types.is_time(kind) or types.is_duration(kind) \
+            or types.is_map(kind):
+        return True
+    if types.is_dictionary(kind):
+        return _needs_arrow_conversion(kind.value_type)
+    if types.is_struct(kind):
+        return any(_needs_arrow_conversion(kind.field(i).type) for i in range(kind.num_fields))
+    if types.is_list(kind) or types.is_large_list(kind) or types.is_fixed_size_list(kind):
+        return _needs_arrow_conversion(kind.value_type)
+    return False
+
+
+def arrow_to_python(array) -> list:
+    """The values of an Arrow array as Python values for cell_text, without pandas or a time zone database.
+
+    Like to_pylist(), except that temporal values are already ISO-8601 text and a map is a dict (its keys
+    as text) -- or, when a key repeats, a list of [key, value] pairs, which a dict cannot hold."""
+    kind, types = array.type, pa.types
+    if types.is_dictionary(kind):
+        return arrow_to_python(array.dictionary_decode())
+    if not _needs_arrow_conversion(kind):
+        return array.to_pylist()
+    if types.is_struct(kind):
+        names = [kind.field(i).name for i in range(kind.num_fields)]
+        columns = [arrow_to_python(array.field(i)) for i in range(len(names))]
+        rows = zip(*columns) if columns else ([] for _ in range(len(array)))
+        return [dict(zip(names, row)) if valid else None for valid, row in zip(array.is_valid().to_pylist(), rows)]
+    if types.is_map(kind):
+        out = []
+        for item in array:
+            if not item.is_valid:
+                out.append(None)
+                continue
+            keys, values = arrow_to_python(item.values.field(0)), arrow_to_python(item.values.field(1))
+            names = [key if isinstance(key, str) else cell_text(key) for key in keys]
+            out.append(dict(zip(names, values)) if len(set(names)) == len(names)
+                       else [[key, value] for key, value in zip(keys, values)])
+        return out
+    if types.is_list(kind) or types.is_large_list(kind) or types.is_fixed_size_list(kind):
+        return [arrow_to_python(item.values) if item.is_valid else None for item in array]
+    return _temporal_texts(array)
+
+
+def _text_cells(array) -> list:
+    return ["" if v is None else v for v in array.to_pylist()]
+
+
+def _all_cells(array) -> list:
+    return [cell_text(v) for v in array.to_pylist()]
+
+
+def _converted_cells(array) -> list:
+    return [cell_text(v) for v in arrow_to_python(array)]
+
+
+def column_converter(kind):
+    """The function that turns one column (an Arrow array) into a list of text cells: string columns pass
+    through (null becomes empty text), types to_pylist() cannot render as they are written go through
+    arrow_to_python, everything else through cell_text."""
+    if pa.types.is_dictionary(kind):
+        kind = kind.value_type
+    string_checks = [pa.types.is_string, pa.types.is_large_string]
+    string_checks += [getattr(pa.types, "is_string_view")] if hasattr(pa.types, "is_string_view") else []
+    if any(check(kind) for check in string_checks):
+        return _text_cells
+    return _converted_cells if _needs_arrow_conversion(kind) else _all_cells
+
+
+class ParquetExtractedInput(ExtractedInput):
+    """An extracted parquet file, read one row group at a time (a reader that spans several row groups
+    keeps everything it has read).  Rows are numbered from 1 in file order."""
+
+    BATCH_ROWS = 10000
+    output_encoding = "utf-8-sig"
+
+    def __init__(self, path, header: list, converters: list, limit: int = None, rows: set = None,
+                 label: str = "", kinds: list = None):
+        super().__init__(path, header, limit, rows)
+        self._converters = converters
+        self.label = label or Path(path).name
+        self.kinds = kinds or [None] * len(header)
+        self.num_row_groups = None
+
+    @classmethod
+    def open(cls, path, label: str, limit: int = None, rows: set = None):
+        """Validate an extracted parquet file (before any row is read) and return its reader."""
+        if pq is None:
+            raise InputError("pyarrow is required to read parquet files: pip install pyarrow")
+        # a Python file handle, closed here whatever happens: pyarrow can keep the handle of a file it
+        # failed to open until garbage collection, which on Windows blocks deleting a corrupt file
+        try:
+            handle = open(str(path), "rb")
+        except OSError as exc:
+            raise InputError("%s: cannot open the file: %s" % (label, exc))
+        with handle:
+            try:
+                pf = pq.ParquetFile(handle)
+                schema = pf.schema_arrow
+            except Exception as exc:
+                raise InputError("%s: cannot read the parquet file: %s" % (label, exc)) from None
+            header = list(schema.names)
+            check_required_columns(header, label)
+            for name in ("SourceElementPath", "Value"):
+                kind = schema.field(name).type
+                if not is_text_type(kind):
+                    raise InputError("%s: column %r has type %s, not text; it must hold the extracted text "
+                                     "(see EXTRACTION_QC.md)" % (label, name, kind))
+            converters = [column_converter(field.type) for field in schema]
+            groups = pf.metadata.num_row_groups
+        source = cls(path, header, converters, limit, rows, label=label, kinds=[field.type for field in schema])
+        source.num_row_groups = groups
+        return source
+
+    def _convert(self, batch) -> list:
+        """One list of text cells per column; a column that cannot be converted is named in the error."""
+        columns = []
+        for i, convert in enumerate(self._converters):
+            try:
+                columns.append(convert(batch.column(i)))
+            except Exception as exc:
+                raise InputError("%s: column %r (type %s) could not be converted to text: %s"
+                                 % (self.label, self.header[i], self.kinds[i], exc)) from None
+        return columns
+
+    def _outside(self, before: int, size: int):
+        """For the `size` rows after row number `before`: None = every wanted row is behind us, stop;
+        True = none of these rows is wanted; False = read them."""
+        first, last = before + 1, before + size
+        if (self.limit is not None and first > self.limit) or (self.last_row is not None and first > self.last_row):
+            return None
+        if self.rows_filter is not None and not any(first <= r <= last for r in self.rows_filter):
+            return True
+        return False
+
+    def rows(self):
+        with open(str(self.path), "rb") as handle:  # closed when the generator ends or is abandoned
+            pf = pq.ParquetFile(handle)
+            number = 0
+            for group in range(pf.metadata.num_row_groups):
+                size = pf.metadata.row_group(group).num_rows
+                if size == 0:
+                    continue
+                skip = self._outside(number, size)
+                if skip is None:
+                    return
+                if skip:
+                    number += size
+                    continue
+                for batch in pf.iter_batches(batch_size=self.BATCH_ROWS, row_groups=[group]):
+                    skip = self._outside(number, batch.num_rows)
+                    if skip is None:
+                        return
+                    if skip:
+                        number += batch.num_rows
+                        continue
+                    for values in zip(*self._convert(batch)):
+                        number += 1
+                        wanted = self._wanted(number)
+                        if wanted is None:
+                            return
+                        if wanted:
+                            yield number, list(values)
+
+
+def open_extracted(triple, header: list, limit: int = None, rows: set = None) -> ExtractedInput:
+    """The reader for the extracted file of an md5 whose inputs have been validated by prepare_triple."""
+    if triple.extracted_format == "parquet":
+        return ParquetExtractedInput.open(triple.extracted, triple.label, limit, rows)
+    return CsvInput(triple.extracted, header, limit=limit, rows=rows, encoding=triple.encoding,
+                    errors=triple.encoding_errors)
 
 
 def parse_row_list(text: str) -> set:
@@ -1201,6 +1695,11 @@ class DebugCollector:
     def __init__(self, show_values: bool = False):
         self.show_values = show_values
         self.scope = ""
+        self.layout = ""                 # "folder" or "flat"; empty when not set
+        self.extracted = ""              # the extracted file used, as shown in messages
+        self.extracted_pattern = ""      # the same without the md5, for the block that is pasted elsewhere
+        self.extracted_format = "csv"
+        self.extracted_groups = None     # row groups of an extracted parquet
         self.profile = {}
         self.skeletons = {}       # lane -> skeleton entries with data-like keys masked
         self.skeletons_raw = {}   # the same with real keys; only kept with --show-values
@@ -1421,13 +1920,18 @@ class DebugCollector:
         if not paste:
             lines.append("input: %s" % csv_name)
         lines.append("-- input")
+        if self.layout:
+            lines.append("layout: %s; extracted file: %s (%s)" % (
+                self.layout, (self.extracted_pattern or "<md5>") if paste else self.extracted,
+                self.extracted_format))
         for lane in LANE_FILES:
             p = self.profile.get(lane)
             if p:
                 lines.append("%s: rows=%s row_groups=%s json_column=%r (%s)"
                              % (lane, count(p["rows"]), count(p["groups"]), p["column"], p["type"]))
-        lines.append("csv: rows=%s%s | SourceLine order: %s | RelevancyParquetLine order: %s" % (
-            count(summary.rows), " (%s)" % self.scope if self.scope else "",
+        groups = ", row_groups=%s" % count(self.extracted_groups) if self.extracted_groups is not None else ""
+        lines.append("%s: rows=%s%s%s | SourceLine order: %s | RelevancyParquetLine order: %s" % (
+            self.extracted_format, count(summary.rows), groups, " (%s)" % self.scope if self.scope else "",
             "ascending" if self.ascending["SourceLine"] else "not ascending",
             "ascending" if self.ascending["RelevancyParquetLine"] else "not ascending"))
         lines.append(self._result_line(summary))
@@ -1457,7 +1961,7 @@ def is_trial(args) -> bool:
     return args.limit is not None or getattr(args, "rows_set", None) is not None
 
 
-def check_output_writable(path: Path) -> None:
+def check_output_writable(path: Path, shown: str = None) -> None:
     """Fail now, not after the whole run, if another program (Excel, on Windows) holds the output open."""
     if path.exists():
         try:
@@ -1465,7 +1969,65 @@ def check_output_writable(path: Path) -> None:
                 pass
         except OSError as exc:
             raise InputError("cannot write %s: %s. Is it open in another program? Close it and run again."
-                             % (path.name, exc))
+                             % (shown or path.name, exc))
+
+
+SCRIPT_PATH = Path(__file__)
+
+
+def script_time_ns() -> int:
+    """When this script was last changed: a result older than that may come from different code."""
+    try:
+        return SCRIPT_PATH.stat().st_mtime_ns
+    except (OSError, AttributeError):
+        return 0
+
+
+def wrong_rows(path: Path):
+    """How many rows a finished verified CSV marks Wrong overall, or None when it cannot be read as one."""
+    try:
+        with open(str(path), newline="", encoding="utf-8-sig") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            if not header or header[-len(OUTPUT_COLUMNS):] != OUTPUT_COLUMNS:
+                return None
+            return sum(1 for row in reader if row and row[-1] == WRONG)
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return None
+
+
+class Skip(str):
+    """The message printed for an md5 that is not checked again.  `wrong` is how many Wrong rows its
+    verified file holds, read only when --fail-on-wrong needs it, else None."""
+
+    wrong = None
+
+
+def skip_reason(triple: Triple, args):
+    """Why this md5 need not be checked again (a Skip message), or None when it must be.
+
+    Only in the folder layout, and only when verified/<md5>_verified.csv exists and is newer than the
+    extracted, original and relevant files it would use and than this script.  --force, a trial run (it
+    writes its own file), a missing input (the message about it must still appear) and an ambiguous
+    extracted file never skip.  A .partial file is a different name, so an interrupted run is never taken
+    for a finished one.  With --fail-on-wrong the verified file is read for its Wrong rows, so that a
+    skipped md5 still counts; a file that cannot be read that way is checked again.
+    """
+    if args.force or is_trial(args) or triple.layout != FOLDER or triple.error:
+        return None
+    inputs = (triple.extracted, triple.original, triple.relevant)
+    if not triple.verified.is_file() or not all(path.is_file() for path in inputs):
+        return None
+    if triple.verified.stat().st_mtime_ns <= max([path.stat().st_mtime_ns for path in inputs] + [script_time_ns()]):
+        return None
+    wrong = wrong_rows(triple.verified) if getattr(args, "fail_on_wrong", False) else None
+    if getattr(args, "fail_on_wrong", False) and wrong is None:
+        return None
+    message = Skip("skipped, %s is newer than its inputs and this script%s; --force rechecks it%s" % (
+        triple.show(triple.verified), "" if wrong is None else " (%s row(s) Wrong)" % format(wrong, ","),
+        " (and is needed for --debug)" if args.debug else ""))
+    message.wrong = wrong
+    return message
 
 
 def check_temp_dir(args) -> None:
@@ -1478,12 +2040,21 @@ def verify_triple(triple: Triple, args, progress=None, collector=None) -> Summar
     """Check one extracted CSV against its two parquet files and write <md5>_verified.csv
     (<md5>_verified_trial.csv for a --limit / --rows run)."""
     header = prepare_triple(triple, encoding=getattr(args, "csv_encoding", None))
-    if progress is not None and triple.encoding_note:
-        progress("note: " + triple.encoding_note)
-    csv_input = CsvInput(triple.extracted, header, limit=args.limit, rows=getattr(args, "rows_set", None),
-                         encoding=triple.encoding)
+    if progress is not None:
+        for note in triple.notes:
+            progress(note)
+        if triple.encoding_note:
+            progress("note: " + triple.encoding_note)
+    csv_input = open_extracted(triple, header, limit=args.limit, rows=getattr(args, "rows_set", None))
+    if collector is not None:
+        collector.layout = triple.layout
+        collector.extracted = triple.label
+        collector.extracted_pattern = triple.pattern
+        collector.extracted_format = triple.extracted_format
+        collector.extracted_groups = getattr(csv_input, "num_row_groups", None)
     target = triple.trial if is_trial(args) else triple.verified
-    check_output_writable(target)
+    shown = triple.show(target)
+    check_output_writable(target, shown)
     check_temp_dir(args)
     relevant = ParquetJson(triple.relevant, args.relevant_column, "--relevant-column")
     try:
@@ -1492,10 +2063,14 @@ def verify_triple(triple: Triple, args, progress=None, collector=None) -> Summar
         relevant.close()
         raise
     summary = Summary()
-    summary.output_name = target.name
+    summary.output_name = shown
     partial = target.with_name(target.name + ".partial")
     keep_partial = False
     try:
+        try:  # only now, once the inputs have validated: a bad md5 leaves no verified/ folder behind
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise InputError("cannot create the folder %s: %s" % (triple.show(target.parent), exc))
         with tempfile.TemporaryDirectory(prefix="extraction_qc_", dir=getattr(args, "temp_dir", None)) as tmp:
             relevant_results, original_results = Path(tmp) / "relevant.csv", Path(tmp) / "original.csv"
             run_lane("relevant", csv_input, "RelevancyParquetLine", relevant, relevant_results,
@@ -1517,7 +2092,7 @@ def verify_triple(triple: Triple, args, progress=None, collector=None) -> Summar
             keep_partial = True  # the checks took the time; do not throw their results away
             raise InputError("the checks are finished but %s could not be replaced (%s). The results are kept in "
                              "%s: close the program that has %s open, then rename that file."
-                             % (target.name, exc, partial.name, target.name))
+                             % (shown, exc, triple.show(partial), shown))
     finally:
         relevant.close()
         original.close()
@@ -1542,13 +2117,17 @@ def positive_int(text: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="QC: verify an extracted-values CSV against the relevant and original parquet files.",
-        epilog="Files are found by name in the working folder: <md5>_extracted.csv, "
-        "<md5>_original.parquet and <md5>_relevant.parquet.",
+        epilog="Folder layout (used when an extracted/ folder exists): extracted/<md5>.csv, "
+        "original/<md5>.parquet and relevant/<md5>.parquet in, verified/<md5>_verified.csv out. "
+        "Flat layout: <md5>_extracted.csv, <md5>_original.parquet and <md5>_relevant.parquet in one folder, "
+        "the result next to them. Files are found by name.",
     )
     parser.add_argument("--folder", type=Path, default=Path("."),
-                        help="Folder holding the input files (default: the current folder)")
+                        help="Folder holding the layout: the extracted/ original/ relevant/ verified/ folders, "
+                        "or the flat <md5>_* files (default: the current folder)")
     parser.add_argument("--debug", action="store_true",
-                        help="Also print a short value-masked diagnostic block and write <md5>_debug_report.txt")
+                        help="Also print a short value-masked diagnostic block and write <md5>_debug_report.txt "
+                        "(<md5>_debug_report_trial.txt for a --limit / --rows run)")
     parser.add_argument("--show-values", action="store_true",
                         help="With --debug: show real values in the local debug report (the printed block stays masked)")
     parser.add_argument("--limit", type=positive_int, metavar="N",
@@ -1572,7 +2151,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temp-dir", type=Path, metavar="FOLDER",
                         help="Folder for the working files of a run (default: the system temporary folder)")
     parser.add_argument("--fail-on-wrong", action="store_true",
-                        help="Exit with code 3 when all files were checked but some rows are Wrong")
+                        help="Exit with code 3 when all files were checked but some rows are Wrong. An md5 skipped "
+                        "as already verified counts too: its verified file is read for its Wrong rows")
+    parser.add_argument("--force", action="store_true",
+                        help="Check every md5 even when its verified file is up to date. In the folder layout an md5 "
+                        "whose verified file is newer than its inputs and this script is skipped; use --force after "
+                        "changing switches that change results, such as --check-same-document")
     return parser
 
 
@@ -1603,12 +2187,24 @@ def main(argv=None) -> int:
         parser.error(str(exc))
     if args.show_values and not args.debug:
         print("warning: --show-values has no effect without --debug", file=sys.stderr)
-    triples = find_triples(args.folder)
+    found = discover(args.folder)
+    for note in found.notes:
+        print(note, file=sys.stderr)
+    triples = found.triples
     if not triples:
-        print("No *%s file found in %s" % (EXTRACTED_SUFFIX, args.folder.resolve()), file=sys.stderr)
+        where = "*%s file found in %s" % (EXTRACTED_SUFFIX, args.folder.resolve())
+        if found.layout == FOLDER:
+            where = ".csv or .parquet file found in %s" % (args.folder / "extracted").resolve()
+        print("No %s" % where, file=sys.stderr)
         return 1
-    failed, any_wrong = 0, False
+    checked, skipped, failed, any_wrong = 0, 0, 0, False
     for triple in triples:
+        reason = skip_reason(triple, args)
+        if reason:
+            skipped += 1
+            print("%s: %s" % (triple.label, reason))
+            any_wrong = any_wrong or bool(reason.wrong)
+            continue
         collector = DebugCollector(show_values=args.show_values) if args.debug else None
         try:
             summary = verify_triple(triple, args, progress=progress, collector=collector)
@@ -1617,22 +2213,25 @@ def main(argv=None) -> int:
             failed += 1
             continue
         except Exception as exc:  # a bug or an odd file must not cost the other files their check
-            print("ERROR: %s: unexpected failure (%s: %s)" % (triple.extracted.name, type(exc).__name__, exc),
+            print("ERROR: %s: unexpected failure (%s: %s)" % (triple.label, type(exc).__name__, exc),
                   file=sys.stderr)
             if args.debug:
                 traceback.print_exc()
             failed += 1
             continue
-        print("\n".join(summary.lines(triple.extracted.name, summary.output_name)))
+        print("\n".join(summary.lines(triple.label, summary.output_name)))
+        checked += 1
         any_wrong = any_wrong or summary.verdicts["overall"][WRONG] > 0
         if collector is not None:
-            full = collector.report(summary, triple.extracted.name, paste=False, reveal=args.show_values)
+            full = collector.report(summary, triple.label, paste=False, reveal=args.show_values)
+            report_path = triple.trial_debug_report if is_trial(args) else triple.debug_report
             try:
-                triple.debug_report.write_text("\n".join(full) + "\n", encoding="utf-8")
-                print("\ndebug report written to %s\n" % triple.debug_report)
+                report_path.write_text("\n".join(full) + "\n", encoding="utf-8")
+                print("\ndebug report written to %s\n" % triple.show(report_path))
             except OSError as exc:
-                print("\nwarning: could not write %s: %s\n" % (triple.debug_report.name, exc), file=sys.stderr)
-            print("\n".join(collector.report(summary, triple.extracted.name, paste=True)))
+                print("\nwarning: could not write %s: %s\n" % (triple.show(report_path), exc), file=sys.stderr)
+            print("\n".join(collector.report(summary, triple.label, paste=True)))
+    print("\ntotal: %d checked, %d skipped, %d failed" % (checked, skipped, failed))
     if failed:
         return 1
     return 3 if args.fail_on_wrong and any_wrong else 0

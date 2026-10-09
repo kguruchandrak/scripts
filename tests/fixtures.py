@@ -5,6 +5,8 @@ row groups of 3 -> 3 + 1).  Relevant lines 1..4 are original lines 1, 3, 4, 8.
 """
 import csv
 import json
+import os
+import time
 from collections import namedtuple
 from pathlib import Path
 
@@ -144,4 +146,43 @@ def write_fixture(folder: Path, prefix: str = PREFIX, cases: list = None) -> dic
     write_parquet(paths["original"], ORIGINAL_DOCS)
     write_parquet(paths["relevant"], RELEVANT_DOCS)
     write_csv(paths["extracted"], [extracted_row(c, prefix) for c in cases])
+    return paths
+
+
+def write_extracted_parquet(path: Path, rows: list, header: list = None, row_group_size: int = None) -> None:
+    """An extracted parquet file whose columns are all text, from rows of strings (the same rows a CSV holds)."""
+    header = HEADER if header is None else header
+    table = pa.table({name: pa.array([row[i] for row in rows], pa.string()) for i, name in enumerate(header)})
+    pq.write_table(table, str(path), row_group_size=row_group_size)
+
+
+def backdate(paths, seconds: int = 60) -> None:
+    """Give files a modification time in the past, so that a result written afterwards is strictly newer than
+    they are, however coarse the file system's clock is."""
+    ns = time.time_ns() - seconds * 10 ** 9
+    for path in paths:
+        os.utime(str(path), ns=(ns, ns))
+
+
+def write_folder_fixture(folder: Path, prefix: str = PREFIX, cases: list = None, extracted_format: str = "csv") -> dict:
+    """The same documents and cases laid out as extracted/<md5>.csv (or .parquet, all-text columns in row
+    groups of 7), original/<md5>.parquet and relevant/<md5>.parquet under folder (the folder layout).
+    The files are given a modification time a minute in the past (see backdate).  Returns the three paths."""
+    folder = Path(folder)
+    cases = CASES if cases is None else cases
+    for name in ("extracted", "original", "relevant"):
+        (folder / name).mkdir(parents=True, exist_ok=True)
+    paths = {
+        "original": folder / "original" / ("%s.parquet" % prefix),
+        "relevant": folder / "relevant" / ("%s.parquet" % prefix),
+        "extracted": folder / "extracted" / ("%s.%s" % (prefix, extracted_format)),
+    }
+    write_parquet(paths["original"], ORIGINAL_DOCS)
+    write_parquet(paths["relevant"], RELEVANT_DOCS)
+    rows = [extracted_row(c, prefix) for c in cases]
+    if extracted_format == "parquet":
+        write_extracted_parquet(paths["extracted"], rows, row_group_size=7)
+    else:
+        write_csv(paths["extracted"], rows)
+    backdate(paths.values())
     return paths

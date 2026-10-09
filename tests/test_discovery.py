@@ -45,7 +45,7 @@ class DiscoveryTest(unittest.TestCase):
         paths = fixtures.write_fixture(self.folder)
         paths["original"].unlink()
         err = io.StringIO()
-        with contextlib.redirect_stderr(err):
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             code = qc.main(["--folder", str(self.folder)])
         self.assertEqual(code, 1)
         self.assertIn("abc123_original.parquet", err.getvalue())

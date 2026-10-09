@@ -598,7 +598,7 @@ class SizeLimitTest(DebugTestCase):
     def test_paste_block_is_printed_by_main_within_the_limits(self):
         self.heavy_inputs()
         _, out, _ = self.run_main("--debug")
-        block = out[out.index("extraction_qc debug"):].splitlines()
+        block = out[out.index("extraction_qc debug"):].split("\ntotal:")[0].splitlines()   # the block ends before the total line
         self.assertLessEqual(len(block), qc.PASTE_MAX_LINES)
         self.assertLessEqual(max(len(l) for l in block), qc.PASTE_MAX_WIDTH)
 
